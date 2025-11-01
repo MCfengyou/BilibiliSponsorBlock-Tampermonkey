@@ -2,317 +2,505 @@
 // @license MIT
 // @name         BilibiliSponsorBlock-Tampermonkey
 // @namespace    https://github.com/MCfengyou/BilibiliSponsorBlock-Tampermonkey
-// @version      0.3
+// @version      1.1
 // @description  使用 bsbsb.top API 跳过标注片段，并以绿色在进度条上标注广告时段
 // @author       NeoGe_and_GPT-5
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/*
 // @grant        none
 // @run-at       document-idle
+// @downloadURL https://update.greasyfork.org/scripts/553623/BilibiliSponsorBlock-Tampermonkey.user.js
+// @updateURL https://update.greasyfork.org/scripts/553623/BilibiliSponsorBlock-Tampermonkey.meta.js
 // ==/UserScript==
- 
- 
+
+
+
 (function() {
   'use strict';
-  console.log('[BSB+ FIX3 v3.1] loaded');
- 
-  let video = null;
+  const LOG = (...a)=>console.log('[BSB+ FIX6R7]',...a);
+  const API = 'https://bsbsb.top/api/skipSegments?videoID=';
+
+  // state
+  let currentBV = null;
   let segments = [];
-  let currentBVID = null;
-  let markersContainer = null;
-  let manualWhitelist = new Set();
-  let userInteracting = false;
-  let skipCooldown = false;
- 
-  const POLL_INTERVAL = 1000;
-  const SEGMENT_COLOR = 'rgba(0,255,0,0.52)';
-  const LOG = (...a)=>console.log('[BSB+ FIX3]',...a);
- 
-  // --- helpers ---
-  function getBVIDFromUrl() {
-    const m = location.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/);
-    return m ? m[1] : null;
-  }
-  function getCID() {
+  let videoEl = null;
+  let progressEl = null;
+  let markerLayer = null;
+  let observer = null;
+  let pendingPrompt = null;    // { seg, rule, key }
+  let promptTimer = null;
+
+  // control flags
+  let manualInSegment = false; // user manually entered this ad segment
+  let userSeeking = false;
+  let suppressedSegmentKey = null; // the segment key for which prompts are suppressed while inside it
+  let lastTime = 0;
+
+  // throttle
+  let renderScheduled = false;
+  let lastProgressCheck = 0;
+
+  const CATEGORY_RULES = {
+    intro:       { label: '过场/开场动画', color: 'rgb(0,255,255)', mode: 'manual' },
+    selfpromo:   { label: '无偿/自我推广', color: 'rgb(255,255,0)', mode: 'manual' },
+    sponsor:     { label: '赞助/恰饭', color: 'rgb(0,212,0)', mode: 'auto' },
+    interaction: { label: '三连/互动提醒', color: 'rgb(204,0,255)', mode: 'manual' },
+    preview:     { label: '回顾/概要', color: 'rgb(0,143,214)', mode: 'marker' },
+    outro:       { label: '鸣谢/结束画面', color: 'rgb(2,2,237)', mode: 'manual' }
+  };
+
+  // ---------- helpers ----------
+  function getBV(){ const m = location.href.match(/BV[0-9A-Za-z]+/); return m ? m[0] : null; }
+
+  async function fetchSegments(bv) {
+    if (!bv) return [];
     try {
-      const s = window.__INITIAL_STATE__;
-      return s?.videoData?.cid || s?.epInfo?.cid || s?.pages?.[0]?.cid || null;
-    } catch (e) { return null; }
-  }
- 
-  // --- robust fetch with multiple endpoints and content-type check ---
-  async function fetchWithTimeout(resource, options = {}) {
-    const { timeout = 6000 } = options;
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    try {
-      const res = await fetch(resource, { ...options, signal: controller.signal });
-      clearTimeout(id);
-      return res;
-    } finally {
-      clearTimeout(id);
+      const res = await fetch(API + bv);
+      if (!res.ok) { LOG('segment API status', res.status); return []; }
+      const json = await res.json();
+      if (!Array.isArray(json)) return [];
+      return json.map(item => ({
+        start: Number(item.segment?.[0] ?? item.start ?? 0),
+        end: Number(item.segment?.[1] ?? item.end ?? 0),
+        category: item.category ?? 'sponsor'
+      })).filter(s => CATEGORY_RULES[s.category] && isFinite(s.start) && isFinite(s.end) && s.end > s.start);
+    } catch (e) {
+      LOG('fetchSegments error', e);
+      return [];
     }
   }
- 
-  async function fetchSegments(bvid) {
-    if (!bvid) return [];
-    const cid = getCID();
-    // endpoint templates to try (note: real project uses /api/skipSegments?videoID=BV..)
-    const endpoints = [
-      { base: 'https://bsbsb.top/api/skipSegments', paramName: 'videoID' },
-      { base: 'https://bsbsb.top/api/skipSegments', paramName: 'bvid' }, // try alternative
-      { base: 'https://bsbsb.top/api/segments', paramName: 'videoID' },
-      { base: 'https://bsbsb.top/api/segments', paramName: 'bvid' }
-    ];
- 
-    for (const ep of endpoints) {
-      try {
-        const url = new URL(ep.base);
-        url.searchParams.set(ep.paramName, bvid);
-        if (cid) url.searchParams.set('cid', cid);
-        LOG('Trying SponsorBlock API:', url.toString());
-        let res;
-        try {
-          res = await fetchWithTimeout(url.toString(), { timeout: 7000, credentials: 'omit' });
-        } catch (e) {
-          LOG('Fetch failed/timeout for', url.toString(), e && e.name ? e.name : e);
-          continue;
-        }
-        if (!res.ok) {
-          LOG('Non-ok status', res.status, 'for', url.toString());
-          continue;
-        }
-        const ctype = res.headers.get('content-type') || '';
-        if (!ctype.includes('application/json')) {
-          LOG('Response not JSON (content-type=', ctype, '), skipping this endpoint');
-          // avoid trying to parse HTML error page
-          continue;
-        }
-        const data = await res.json();
-        // parse returned structure (two common shapes)
-        const parsed = [];
-        if (Array.isArray(data)) {
-          // array might be segments directly or wrapper with segments
-          for (const item of data) {
-            if (item.segment && Array.isArray(item.segment)) {
-              parsed.push({ start: Number(item.segment[0]), end: Number(item.segment[1]), category: item.category || '' });
-            } else if (item.segments && Array.isArray(item.segments)) {
-              for (const s of item.segments) {
-                if (s.segment) parsed.push({ start: Number(s.segment[0]), end: Number(s.segment[1]), category: s.category || '' });
-              }
-            }
-          }
-        } else if (data && typeof data === 'object') {
-          // some APIs return { segments: [...] }
-          if (data.segments && Array.isArray(data.segments)) {
-            for (const s of data.segments) {
-              if (s.segment) parsed.push({ start: Number(s.segment[0]), end: Number(s.segment[1]), category: s.category || '' });
-            }
-          }
-        }
-        parsed.sort((a,b)=>a.start-b.start);
-        LOG('Parsed segments count:', parsed.length, 'from', url.toString());
-        return parsed;
-      } catch (err) {
-        LOG('Error while trying endpoint', err);
-        continue;
-      }
-    }
-    LOG('All endpoints tried, no valid JSON segments returned.');
-    return [];
-  }
- 
-  // --- DOM utilities ---
+
   function findVideo() {
-    return document.querySelector('video');
+    const vids = Array.from(document.querySelectorAll('video'));
+    for (const v of vids) if (v.offsetParent !== null || v.getClientRects().length) return v;
+    return vids[0] || null;
   }
-  function findProgressBar() {
-    // try several selectors; B 站 UI differs by skin
+
+  function findProgress() {
     const candidates = [
-      '.bpx-player-progress', '.bpx-player-progress-wrapper',
-      '.bilibili-player-video-progress', '.bilibili-player-progress',
-      '.bui-progress', '.bilibili-player-video-control-bottom .bui-progress'
+      '.bpx-player-progress-wrap',
+      '.bpx-player-progress',
+      '.bilibili-player-video-progress',
+      '.bilibili-player-progress',
+      '.bui-progress'
     ];
     for (const s of candidates) {
       const el = document.querySelector(s);
       if (el) return el;
     }
-    // fallback: find element that looks like a progress bar (role=slider)
-    const slider = document.querySelector('[role="slider"]');
-    if (slider) return slider;
+    // fallback near controls
+    const ctrl = document.querySelector('.bilibili-player-video-control-bottom') || document.querySelector('.bpx-player-container');
+    if (ctrl) {
+      const el = ctrl.querySelector('.bpx-player-progress-wrap, .bpx-player-progress, .bilibili-player-video-progress');
+      if (el) return el;
+    }
     return null;
   }
- 
-  function ensureMarkerContainer(progressEl) {
-    if (!progressEl) return;
-    if (markersContainer && progressEl.contains(markersContainer)) return markersContainer;
-    // remove old if exists
-    if (markersContainer && markersContainer.parentElement) markersContainer.parentElement.removeChild(markersContainer);
-    const node = document.createElement('div');
-    node.className = 'bsb-marker-container';
-    Object.assign(node.style, {
-      position: 'absolute',
-      left: 0, top: 0, width: '100%', height: '100%',
-      pointerEvents: 'none', zIndex: 9999,
-    });
-    // make sure parent is positioned
-    const computed = getComputedStyle(progressEl);
-    if (computed.position === 'static') progressEl.style.position = 'relative';
-    progressEl.appendChild(node);
-    markersContainer = node;
-    return node;
-  }
- 
-  function renderMarkers() {
-    if (!markersContainer || !video) return;
-    markersContainer.innerHTML = '';
-    const dur = video.duration || 0;
-    if (!dur || !isFinite(dur) || dur <= 0) return;
-    for (const s of segments) {
-      if (s.end <= s.start) continue;
-      const left = (s.start / dur) * 100;
-      const width = ((s.end - s.start) / dur) * 100;
-      const mark = document.createElement('div');
-      Object.assign(mark.style, {
-        position: 'absolute',
-        left: left + '%',
-        width: width + '%',
-        top: 0,
-        height: '100%',
-        background: SEGMENT_COLOR,
-        pointerEvents: 'none' // do not capture clicks
+
+  function ensureMarkerLayerAttached() {
+    const p = findProgress();
+    if (!p) return null;
+    progressEl = p;
+    if (markerLayer && markerLayer.parentElement && markerLayer.parentElement !== progressEl) {
+      markerLayer.remove();
+      markerLayer = null;
+    }
+    if (!markerLayer) {
+      markerLayer = document.createElement('div');
+      markerLayer.className = 'bsb-marker-layer';
+      Object.assign(markerLayer.style, {
+        position: 'absolute', left: '0', top: '0', width: '100%', height: '100%', pointerEvents: 'none', zIndex: 9
       });
-      markersContainer.appendChild(mark);
+    }
+    const cs = getComputedStyle(progressEl);
+    if (cs.position === 'static') progressEl.style.position = 'relative';
+    if (!progressEl.contains(markerLayer)) progressEl.appendChild(markerLayer);
+    return markerLayer;
+  }
+
+  function renderMarkers() {
+    if (!videoEl) return;
+    const p = findProgress();
+    if (!p) return;
+    ensureMarkerLayerAttached();
+    const dur = videoEl.duration || 0;
+    if (!dur || !isFinite(dur) || dur <= 0) return;
+    const html = segments.map(seg => {
+      const rule = CATEGORY_RULES[seg.category];
+      if (!rule) return '';
+      const left = (seg.start / dur) * 100;
+      const width = ((seg.end - seg.start) / dur) * 100;
+      return `<div style="position:absolute;left:${left}%;width:${width}%;height:100%;background:${rule.color};opacity:.45;border-radius:2px;"></div>`;
+    }).join('');
+    markerLayer.innerHTML = html;
+    LOG('Markers rendered (count=' + segments.length + ')');
+  }
+
+  function scheduleRenderThrottled() {
+    if (renderScheduled) return;
+    renderScheduled = true;
+    setTimeout(() => { try { renderMarkers(); } catch (e) { LOG('renderMarkers e', e); } renderScheduled = false; }, 500);
+  }
+
+  function delayedMarkerAttempts(times = 3, interval = 800) {
+    for (let i = 1; i <= times; i++) {
+      setTimeout(() => scheduleRenderThrottled(), i * interval);
     }
   }
- 
-  // --- skip logic (natural play only) ---
-  function findSegmentAtTime(t) {
-    for (const s of segments) if (t >= s.start && t < s.end) return s;
-    return null;
-  }
- 
-  function showSkipNotice(text) {
-    const existing = document.getElementById('bsb-skip-notice');
-    if (existing) existing.remove();
-    const notice = document.createElement('div');
-    notice.id = 'bsb-skip-notice';
-    notice.innerText = text;
-    Object.assign(notice.style, {
-      position: 'fixed',
-      right: '18px',
-      bottom: '86px', // slightly higher to avoid controls
-      padding: '10px 14px',
-      background: 'rgba(0,170,0,0.92)',
-      color: '#fff',
-      borderRadius: '8px',
-      zIndex: 2147483647,
-      pointerEvents: 'none',
-      opacity: '0',
-      transition: 'opacity .25s ease'
-    });
-    const target = document.fullscreenElement || document.body;
-    target.appendChild(notice);
-    requestAnimationFrame(()=> notice.style.opacity = '1');
-    setTimeout(()=> notice.style.opacity = '0', 2200);
-    setTimeout(()=> notice.remove(), 2600);
-  }
- 
-  function attachVideoEvents(v) {
-    if (!v) return;
-    video = v;
-    LOG('attached to video element');
- 
-    // track lastTime to detect natural play (forward small increments)
-    let lastTime = 0;
-    v.addEventListener('timeupdate', () => {
-      if (!video) return;
-      const t = video.currentTime;
-      // clean manual whitelist entries that are past
-      for (const k of Array.from(manualWhitelist)) {
-        const [st, ed] = k.split('-').map(Number);
-        if (t >= ed) manualWhitelist.delete(k);
+
+  // ---------- prompt management ----------
+  // segKey string
+  function segKeyFor(seg){ return `${seg.start}-${seg.end}`; }
+
+  function removePrompt(suppressForCurrentSegment = true) {
+    try {
+      const el = document.getElementById('bsb-prompt');
+      if (el) {
+        // fade out
+        el.style.transition = 'opacity .18s ease';
+        el.style.opacity = '0';
+        setTimeout(()=>{ if (el && el.parentElement) el.remove(); }, 200);
       }
-      const seg = findSegmentAtTime(t);
-      const delta = t - lastTime;
-      const naturalPlay = (delta > 0 && delta < 2 && !userInteracting);
-      if (seg) {
-        const key = `${seg.start}-${seg.end}`;
-        if (manualWhitelist.has(key)) {
-          // user manually entered this segment -> do not auto skip
-        } else if (naturalPlay && !skipCooldown) {
-          skipCooldown = true;
-          try {
-            video.currentTime = Math.min(seg.end + 0.05, video.duration || seg.end + 0.05);
-            showSkipNotice('赞助/恰饭段已跳过 ✓');
-            LOG('auto-skipped segment', seg);
-          } catch (e) {
-            LOG('seek failed', e);
+      if (promptTimer) { clearInterval(promptTimer); promptTimer = null; }
+      if (pendingPrompt && suppressForCurrentSegment) {
+        // Suppress further prompts for this segment while user remains inside it
+        suppressedSegmentKey = pendingPrompt.key;
+        LOG('Suppressed segment', suppressedSegmentKey);
+      }
+      pendingPrompt = null;
+    } catch (e) { LOG('removePrompt error', e); }
+  }
+
+  function showManualPrompt(seg, rule) {
+    try {
+      // if this segment is currently suppressed, do nothing
+      const key = segKeyFor(seg);
+      if (suppressedSegmentKey === key) return;
+
+      // remove any previous prompt cleanly
+      removePrompt(false);
+
+      const div = document.createElement('div');
+      div.id = 'bsb-prompt';
+      // Ensure pointer events enabled and high z-index
+      div.style.cssText = `
+        position:fixed;
+        right:40px;
+        bottom:120px;
+        background:rgba(0,0,0,0.78);
+        color:#fff;
+        padding:10px 14px;
+        border-radius:10px;
+        font-size:14px;
+        z-index:2147483647;
+        display:flex;
+        align-items:center;
+        gap:8px;
+        pointer-events:auto;
+        user-select:none;
+        opacity:0;
+      `;
+
+      const span = document.createElement('span');
+      span.style.color = rule.color;
+      span.innerHTML = `[${rule.label}] ｜ 按 Enter 键跳过 (<span id="bsb-count">5</span>s)`;
+      const closeBtn = document.createElement('span');
+      closeBtn.id = 'bsb-close';
+      closeBtn.textContent = '✕';
+      closeBtn.style.cssText = 'cursor:pointer;margin-left:8px;pointer-events:auto;';
+
+      div.appendChild(span);
+      div.appendChild(closeBtn);
+      document.body.appendChild(div);
+      // fade in
+      requestAnimationFrame(()=> { div.style.transition='opacity .18s'; div.style.opacity='1'; });
+
+      pendingPrompt = { seg, rule, key };
+
+      // timer ensure single timer; always clear older timer first
+      if (promptTimer) { clearInterval(promptTimer); promptTimer = null; }
+      let sec = 5;
+      const countSpan = div.querySelector('#bsb-count');
+      promptTimer = setInterval(() => {
+        sec--;
+        const cnt = document.getElementById('bsb-count');
+        if (cnt) cnt.textContent = sec;
+        if (sec <= 0) {
+          // when timeout expire, we consider this as "user closed via timeout"
+          removePrompt(true);
+        }
+      }, 1000);
+
+      // close button handling - stop propagation and remove prompt + suppress
+      closeBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        removePrompt(true);
+      }, { passive: true });
+
+    } catch (e) { LOG('showManualPrompt error', e); }
+  }
+
+  function showNotice(text, color='rgba(0,212,0,0.92)') {
+    try {
+      const el = document.createElement('div');
+      el.textContent = text;
+      Object.assign(el.style, {
+        position: 'fixed', right: '28px', bottom: '120px',
+        background: color, color: '#fff', padding: '8px 12px',
+        borderRadius: '8px', fontSize: '14px', zIndex: 2147483647,
+        pointerEvents: 'none', opacity: '0', transition: 'opacity .2s'
+      });
+      const target = document.fullscreenElement || document.body;
+      target.appendChild(el);
+      requestAnimationFrame(()=> el.style.opacity='1');
+      setTimeout(()=> el.style.opacity='0', 1600);
+      setTimeout(()=> el.remove(), 2000);
+    } catch (e) { LOG('showNotice error', e); }
+  }
+
+  // ---------- key handling: Enter skip, Delete close ----------
+  if (!window.__bsb_keys_attached) {
+    window.addEventListener('keydown', (ev) => {
+      try {
+        if (!pendingPrompt) return;
+        if (ev.key === 'Enter') {
+          // perform skip
+          if (videoEl && pendingPrompt) {
+            videoEl.currentTime = Math.min(pendingPrompt.seg.end + 0.05, videoEl.duration || pendingPrompt.seg.end + 0.05);
+            showNotice(`${pendingPrompt.rule.label} 已跳过`, pendingPrompt.rule.color);
+            removePrompt(true); // suppress while in segment
           }
-          setTimeout(()=> skipCooldown = false, 900);
+        } else if (ev.key === 'Delete' || ev.key === 'Backspace') {
+          // close prompt without skipping, but suppress while inside
+          removePrompt(true);
+          showNotice('已关闭提示', 'rgba(120,120,120,0.9)');
+        }
+      } catch (e) { LOG('keydown handler error', e); }
+    }, { passive: true });
+    window.__bsb_keys_attached = true;
+  }
+
+  // ---------- playback handlers ----------
+  function inSegmentAtTime(t) {
+    return segments.find(s => t >= s.start && t < s.end);
+  }
+
+  function onTimeUpdate() {
+    if (!videoEl) return;
+    const t = videoEl.currentTime;
+    const seg = inSegmentAtTime(t);
+
+    // if left any previously suppressed segment, clear suppression
+    if (!seg) {
+      if (suppressedSegmentKey) {
+        // user moved out of suppressed segment - reset suppression
+        suppressedSegmentKey = null;
+        LOG('Cleared suppressedSegmentKey (left segment)');
+      }
+      manualInSegment = false;
+      lastTime = t;
+      return;
+    }
+
+    // If we are inside a segment
+    const rule = CATEGORY_RULES[seg.category];
+    if (!rule) { lastTime = t; return; }
+
+    // If the current segment is the suppressed one, do nothing (no prompts)
+    const key = segKeyFor(seg);
+    if (suppressedSegmentKey === key) { lastTime = t; return; }
+
+    // Determine naturalPlay: small positive delta and not currently seeking and not known manualInSegment
+    const delta = t - lastTime;
+    const naturalPlay = delta > 0 && delta < 2 && !userSeeking && !manualInSegment;
+    lastTime = t;
+
+    if (rule.mode === 'auto') {
+      if (naturalPlay) {
+        try {
+          videoEl.currentTime = Math.min(seg.end + 0.05, videoEl.duration || seg.end + 0.05);
+          showNotice(`${rule.label} 已跳过`, rule.color);
+        } catch (e) { LOG('auto skip failed', e); }
+      } else {
+        // user manually seeked into it -> do nothing (allow watching)
+      }
+    } else if (rule.mode === 'manual') {
+      // show prompt only on naturalPlay OR if user arrived exactly at seg.start (special case)
+      // But we must avoid prompting repeatedly: only show if not pendingPrompt and not suppressed
+      if (!pendingPrompt && naturalPlay) {
+        showManualPrompt(seg, rule);
+      }
+      // also: if user just seeked exactly to segment start (we detect in seeking handler and set manualInSegment accordingly),
+      // we want to show prompt when they re-enter segment HEAD (requirement #4). We'll handle that in seeking handler.
+    }
+  }
+
+  function onSeeking() {
+    userSeeking = true;
+    try {
+      const t = videoEl.currentTime;
+      const seg = inSegmentAtTime(t);
+      if (seg) {
+        // user manually entered the segment -> set manualInSegment true and do NOT show prompt instantly
+        manualInSegment = true;
+        // Do NOT set suppressedSegmentKey yet — we only suppress after user actively closes prompt.
+        LOG('User seeking: manualInSegment set for segment', segKeyFor(seg));
+      }
+    } catch (e) { LOG('onSeeking error', e); }
+  }
+
+  function onSeeked() {
+    // If user seeked to just before the segment start (within small tolerance) -- treat as "re-enter at segment head"
+    try {
+      const t = videoEl.currentTime;
+      const seg = inSegmentAtTime(t);
+      if (seg) {
+        const tolerance = 0.35; // seconds tolerance for "segment head"
+        if (Math.abs(t - seg.start) < tolerance) {
+          // reset suppression for this segment so prompt will appear (requirement 4)
+          if (suppressedSegmentKey === segKeyFor(seg)) {
+            suppressedSegmentKey = null;
+            LOG('User jumped to segment head -> cleared suppression for', segKeyFor(seg));
+          }
+          // Show prompt since user explicitly jumped to segment head (but only if not already pending)
+          if (!pendingPrompt && CATEGORY_RULES[seg.category].mode === 'manual') {
+            // show prompt after a tiny delay so timeupdate doesn't race
+            setTimeout(()=>{ if (!pendingPrompt) showManualPrompt(seg, CATEGORY_RULES[seg.category]); }, 60);
+          }
+        } else {
+          // user seeked somewhere inside the segment - mark manualInSegment so we don't auto-skip
+          manualInSegment = true;
+        }
+      } else {
+        // not in segment
+        manualInSegment = false;
+      }
+    } catch (e) { LOG('onSeeked error', e); }
+    // clear seeking flag after short delay
+    setTimeout(()=> { userSeeking = false; }, 700);
+  }
+
+  function attachVideoHandlers(v) {
+    if (!v) return;
+    if (videoEl && videoEl !== v) {
+      try {
+        videoEl.removeEventListener('timeupdate', onTimeUpdate);
+        videoEl.removeEventListener('seeking', onSeeking);
+        videoEl.removeEventListener('seeked', onSeeked);
+        videoEl.removeEventListener('loadedmetadata', onLoadedMetadata);
+      } catch (e) { /* ignore */ }
+    }
+    videoEl = v;
+    videoEl.addEventListener('timeupdate', onTimeUpdate, { passive: true });
+    videoEl.addEventListener('seeking', onSeeking);
+    videoEl.addEventListener('seeked', onSeeked);
+    videoEl.addEventListener('loadedmetadata', onLoadedMetadata);
+    LOG('Attached video handlers.');
+  }
+
+  function onLoadedMetadata() {
+    delayedMarkerAttempts(3, 700);
+  }
+
+  // progress observer
+  function attachProgressObserver() {
+    try {
+      if (observer) { observer.disconnect(); observer = null; }
+      const target = findProgress();
+      if (!target) return;
+      observer = new MutationObserver(()=> scheduleRenderThrottled());
+      observer.observe(target, { childList: true, subtree: true });
+      LOG('Progress observer attached.');
+    } catch (e) { LOG('attachProgressObserver error', e); }
+  }
+
+  // pollers to detect replacements
+  function checkVideoChange() {
+    try {
+      const v = findVideo();
+      if (v && v !== videoEl) {
+        LOG('Detected video element change -> reattach');
+        attachVideoHandlers(v);
+        scheduleRenderThrottled();
+        delayedMarkerAttempts(3,700);
+        attachProgressObserver();
+      }
+    } catch (e) { LOG('checkVideoChange error', e); }
+  }
+
+  function checkProgressAndMarkers() {
+    const now = Date.now();
+    if (now - lastProgressCheck < 900) return;
+    lastProgressCheck = now;
+    try {
+      if (!videoEl) {
+        const v = findVideo();
+        if (v) attachVideoHandlers(v);
+      }
+      if (!videoEl || !segments.length) return;
+      const p = findProgress();
+      if (!p) { delayedMarkerAttempts(3,800); return; }
+      if (!p.contains(markerLayer) || !markerLayer) {
+        LOG('Marker layer missing -> reattach');
+        ensureMarkerLayerAttached();
+        scheduleRenderThrottled();
+        delayedMarkerAttempts(3,700);
+      } else {
+        if (markerLayer && markerLayer.children.length === 0 && segments.length > 0) {
+          scheduleRenderThrottled();
         }
       }
-      lastTime = t;
-    });
- 
-    // seeking handlers: mark manual interactions and add whitelist on seeked if inside a segment
-    v.addEventListener('seeking', ()=> { userInteracting = true; });
-    v.addEventListener('seeked', ()=> {
-      setTimeout(()=>{
-        const t = video.currentTime;
-        const seg = findSegmentAtTime(t);
-        if (seg) {
-          const key = `${seg.start}-${seg.end}`;
-          manualWhitelist.add(key);
-          LOG('用户手动进入广告段，加入白名单:', key);
-        }
-        // keep userInteracting true briefly to avoid racing with timeupdate
-        setTimeout(()=> userInteracting = false, 500);
-      }, 20);
-    });
- 
-    v.addEventListener('loadedmetadata', ()=> {
-      // re-render markers when duration becomes available
-      const p = findProgressBar();
-      ensureMarkerContainer(p);
-      renderMarkers();
-    });
+      if (!observer) attachProgressObserver();
+    } catch (e) { LOG('checkProgressAndMarkers error', e); }
   }
- 
-  // --- main loop ---
-  async function mainLoop() {
-    const bvid = getBVIDFromUrl();
-    if (!bvid) return;
- 
-    if (bvid !== currentBVID) {
-      currentBVID = bvid;
-      LOG('BV changed ->', bvid);
-      // fetch segments robustly
-      segments = await fetchSegments(bvid);
-      // normalize (some API shapes might differ); ensure numeric
-      segments = (segments || []).map(s=>({ start: Number(s.start), end: Number(s.end), category: s.category || '' })).filter(s=>isFinite(s.start) && isFinite(s.end) && s.end > s.start);
-      LOG('segments after normalize:', segments.length);
-      manualWhitelist.clear();
- 
-      // attach or refresh markers
-      const p = findProgressBar();
-      ensureMarkerContainer(p);
-      renderMarkers();
-    }
- 
-    // detect progress bar re-creation and reattach markers
-    const progressEl = findProgressBar();
-    if (progressEl && (!markersContainer || !progressEl.contains(markersContainer))) {
-      ensureMarkerContainer(progressEl);
-      renderMarkers();
-      LOG('Detected progress rebuild -> reattached markers.');
-    }
- 
-    // attach video element if changed
+
+  // init for BV
+  async function initializeForBV() {
+    const bv = getBV(); if (!bv) return;
+    if (bv === currentBV) return;
+    currentBV = bv;
+    LOG('Initialize for', bv);
+    // reset state
+    suppressedSegmentKey = null;
+    manualInSegment = false;
+    userSeeking = false;
+    pendingPrompt && removePrompt(false);
+
+    segments = await fetchSegments(bv);
+    LOG('Segments loaded', segments.length);
+
+    // attach video handlers if present
     const v = findVideo();
-    if (v && v !== video) attachVideoEvents(v);
+    if (v) attachVideoHandlers(v);
+    scheduleRenderThrottled();
+    delayedMarkerAttempts(3, 700);
+    attachProgressObserver();
   }
- 
-  setInterval(mainLoop, POLL_INTERVAL);
- 
+
+  // SPA detection + pollers
+  let lastHref = location.href;
+  setInterval(() => {
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      LOG('URL changed -> schedule init');
+      setTimeout(initializeForBV, 700);
+    }
+    try { checkVideoChange(); checkProgressAndMarkers(); } catch (e) {}
+  }, 800);
+
+  // light global observer to detect heavy DOM churn
+  const globalObserver = new MutationObserver((muts) => {
+    if (muts.length > 8) setTimeout(initializeForBV, 900);
+  });
+  globalObserver.observe(document.body, { childList: true, subtree: true });
+
+  // start
+  setTimeout(initializeForBV, 1200);
+
+  // Expose debug helper
+  window.__bsb_debug_state = () => ({
+    currentBV, segmentsCount: segments.length, videoExists: !!videoEl, progressExists: !!findProgress(), markerExists: !!markerLayer, suppressedSegmentKey
+  });
+
+  LOG('BSB+ FIX6R7 loaded.');
 })();
