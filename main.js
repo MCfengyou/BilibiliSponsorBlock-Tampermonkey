@@ -2,7 +2,7 @@
 // @license MIT
 // @name         BilibiliSponsorBlock-Tampermonkey
 // @namespace    https://github.com/MCfengyou/BilibiliSponsorBlock-Tampermonkey
-// @version      1.1
+// @version      1.2
 // @description  使用 bsbsb.top API 跳过标注片段，并以绿色在进度条上标注广告时段
 // @author       NeoGe_and_GPT-5
 // @match        https://www.bilibili.com/video/*
@@ -12,8 +12,6 @@
 // @downloadURL https://update.greasyfork.org/scripts/553623/BilibiliSponsorBlock-Tampermonkey.user.js
 // @updateURL https://update.greasyfork.org/scripts/553623/BilibiliSponsorBlock-Tampermonkey.meta.js
 // ==/UserScript==
-
-
 
 (function() {
   'use strict';
@@ -27,7 +25,7 @@
   let progressEl = null;
   let markerLayer = null;
   let observer = null;
-  let pendingPrompt = null;    // { seg, rule, key }
+  let pendingPrompt = null;    // { seg, rule, key, action, fromTime, video, deadline }
   let promptTimer = null;
 
   // control flags
@@ -152,37 +150,79 @@
   // segKey string
   function segKeyFor(seg){ return `${seg.start}-${seg.end}`; }
 
+  // ---------- skip / undo ----------
+  const UNDO_SECONDS = 5;
+  const RESKIP_SECONDS = 3;
+  let ownSeekTime = null;
+
+  const uiRoot = () => document.fullscreenElement || document.webkitFullscreenElement || document.body;
+  function movePrompt() {
+    const prompt = document.getElementById('bsb-prompt');
+    if (prompt && !uiRoot().contains(prompt)) uiRoot().appendChild(prompt);
+  }
+  document.addEventListener('fullscreenchange', movePrompt);
+  document.addEventListener('webkitfullscreenchange', movePrompt);
+
+  function performSkip(seg, rule) {
+    if (!videoEl) return false;
+    const fromTime = videoEl.currentTime;
+    if (fromTime < seg.start - 0.15 || fromTime >= seg.end) return false;
+    const target = Math.min(seg.end + 0.05, videoEl.duration || seg.end + 0.05);
+    ownSeekTime = target;
+    videoEl.currentTime = target;
+    showPrompt(seg, rule, 'undo', UNDO_SECONDS, fromTime);
+    return true;
+  }
+
+  function runPromptAction() {
+    const prompt = pendingPrompt;
+    if (!prompt || Date.now() >= prompt.deadline || prompt.video !== videoEl || getBV() !== currentBV) {
+      removePrompt(false);
+      return false;
+    }
+    if (prompt.action === 'undo') {
+      const { seg, rule, fromTime } = prompt;
+      removePrompt(false);
+      // Keep the original auto-skip suppressed after undoing it.
+      suppressedSegmentKey = segKeyFor(seg);
+      manualInSegment = true;
+      const gap = Math.min(0.05, (seg.end - seg.start) / 4);
+      const returnTime = Math.max(seg.start + gap, Math.min(fromTime, seg.end - gap));
+      lastTime = returnTime;
+      ownSeekTime = returnTime;
+      videoEl.currentTime = returnTime;
+      showPrompt(seg, rule, 'skip', RESKIP_SECONDS);
+      return true;
+    }
+    const { seg, rule } = prompt;
+    removePrompt(true);
+    return performSkip(seg, rule);
+  }
+
   function removePrompt(suppressForCurrentSegment = true) {
     try {
       const el = document.getElementById('bsb-prompt');
       if (el) {
-        // fade out
         el.style.transition = 'opacity .18s ease';
         el.style.opacity = '0';
-        setTimeout(()=>{ if (el && el.parentElement) el.remove(); }, 200);
+        setTimeout(() => el.remove(), 200);
       }
       if (promptTimer) { clearInterval(promptTimer); promptTimer = null; }
-      if (pendingPrompt && suppressForCurrentSegment) {
-        // Suppress further prompts for this segment while user remains inside it
+      if (pendingPrompt && suppressForCurrentSegment && pendingPrompt.action === 'skip') {
         suppressedSegmentKey = pendingPrompt.key;
-        LOG('Suppressed segment', suppressedSegmentKey);
       }
       pendingPrompt = null;
     } catch (e) { LOG('removePrompt error', e); }
   }
 
-  function showManualPrompt(seg, rule) {
+  function showPrompt(seg, rule, action = 'skip', seconds = 5, fromTime = null) {
     try {
-      // if this segment is currently suppressed, do nothing
-      const key = segKeyFor(seg);
-      if (suppressedSegmentKey === key) return;
-
-      // remove any previous prompt cleanly
       removePrompt(false);
+      // The old prompt may still be fading out; do not leave duplicate IDs.
+      document.getElementById('bsb-prompt')?.remove();
 
       const div = document.createElement('div');
       div.id = 'bsb-prompt';
-      // Ensure pointer events enabled and high z-index
       div.style.cssText = `
         position:fixed;
         right:40px;
@@ -203,41 +243,39 @@
 
       const span = document.createElement('span');
       span.style.color = rule.color;
-      span.innerHTML = `[${rule.label}] ｜ 按 Enter 键跳过 (<span id="bsb-count">5</span>s)`;
+      span.style.cursor = 'pointer';
+      span.innerHTML = `[${rule.label}] ｜ 按 Enter ${action === 'undo' ? '撤销' : '跳过'} (<span id="bsb-count">${seconds}</span>s)`;
+      span.addEventListener('click', ev => {
+        ev.stopPropagation();
+        runPromptAction();
+      });
+
       const closeBtn = document.createElement('span');
       closeBtn.id = 'bsb-close';
       closeBtn.textContent = '✕';
       closeBtn.style.cssText = 'cursor:pointer;margin-left:8px;pointer-events:auto;';
+      closeBtn.addEventListener('click', ev => {
+        ev.stopPropagation();
+        removePrompt(true);
+      });
 
       div.appendChild(span);
       div.appendChild(closeBtn);
-      document.body.appendChild(div);
-      // fade in
-      requestAnimationFrame(()=> { div.style.transition='opacity .18s'; div.style.opacity='1'; });
+      uiRoot().appendChild(div);
+      requestAnimationFrame(() => { div.style.transition='opacity .18s'; div.style.opacity='1'; });
 
-      pendingPrompt = { seg, rule, key };
-
-      // timer ensure single timer; always clear older timer first
-      if (promptTimer) { clearInterval(promptTimer); promptTimer = null; }
-      let sec = 5;
+      pendingPrompt = {
+        seg, rule, key: segKeyFor(seg), action, fromTime, video: videoEl,
+        deadline: Date.now() + seconds * 1000
+      };
       const countSpan = div.querySelector('#bsb-count');
       promptTimer = setInterval(() => {
-        sec--;
-        const cnt = document.getElementById('bsb-count');
-        if (cnt) cnt.textContent = sec;
-        if (sec <= 0) {
-          // when timeout expire, we consider this as "user closed via timeout"
-          removePrompt(true);
-        }
+        if (!pendingPrompt || pendingPrompt.video !== videoEl) return;
+        const remain = Math.ceil((pendingPrompt.deadline - Date.now()) / 1000);
+        if (remain <= 0) removePrompt(true);
+        else if (countSpan) countSpan.textContent = String(remain);
       }, 1000);
-
-      // close button handling - stop propagation and remove prompt + suppress
-      closeBtn.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        removePrompt(true);
-      }, { passive: true });
-
-    } catch (e) { LOG('showManualPrompt error', e); }
+    } catch (e) { LOG('showPrompt error', e); }
   }
 
   function showNotice(text, color='rgba(0,212,0,0.92)') {
@@ -250,7 +288,7 @@
         borderRadius: '8px', fontSize: '14px', zIndex: 2147483647,
         pointerEvents: 'none', opacity: '0', transition: 'opacity .2s'
       });
-      const target = document.fullscreenElement || document.body;
+      const target = uiRoot();
       target.appendChild(el);
       requestAnimationFrame(()=> el.style.opacity='1');
       setTimeout(()=> el.style.opacity='0', 1600);
@@ -258,25 +296,24 @@
     } catch (e) { LOG('showNotice error', e); }
   }
 
-  // ---------- key handling: Enter skip, Delete close ----------
+  // ---------- key handling: Enter skip / undo, Delete close ----------
   if (!window.__bsb_keys_attached) {
     window.addEventListener('keydown', (ev) => {
       try {
-        if (!pendingPrompt) return;
-        if (ev.key === 'Enter') {
-          // perform skip
-          if (videoEl && pendingPrompt) {
-            videoEl.currentTime = Math.min(pendingPrompt.seg.end + 0.05, videoEl.duration || pendingPrompt.seg.end + 0.05);
-            showNotice(`${pendingPrompt.rule.label} 已跳过`, pendingPrompt.rule.color);
-            removePrompt(true); // suppress while in segment
+        const target = ev.target;
+        if (target?.isContentEditable || target?.closest?.('input,textarea,select,[contenteditable="true"]')) return;
+        if (ev.key === 'Enter' && !ev.repeat && !ev.isComposing &&
+            !ev.shiftKey && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
+          if (pendingPrompt && runPromptAction()) {
+            ev.preventDefault();
+            ev.stopPropagation();
           }
-        } else if (ev.key === 'Delete' || ev.key === 'Backspace') {
-          // close prompt without skipping, but suppress while inside
+        } else if (pendingPrompt && (ev.key === 'Delete' || ev.key === 'Backspace')) {
           removePrompt(true);
           showNotice('已关闭提示', 'rgba(120,120,120,0.9)');
         }
       } catch (e) { LOG('keydown handler error', e); }
-    }, { passive: true });
+    }, { passive: false });
     window.__bsb_keys_attached = true;
   }
 
@@ -290,48 +327,28 @@
     const t = videoEl.currentTime;
     const seg = inSegmentAtTime(t);
 
-    // if left any previously suppressed segment, clear suppression
     if (!seg) {
-      if (suppressedSegmentKey) {
-        // user moved out of suppressed segment - reset suppression
-        suppressedSegmentKey = null;
-        LOG('Cleared suppressedSegmentKey (left segment)');
-      }
+      if (suppressedSegmentKey) suppressedSegmentKey = null;
       manualInSegment = false;
+      if (pendingPrompt?.action === 'skip') removePrompt(false);
       lastTime = t;
       return;
     }
 
-    // If we are inside a segment
+    const key = segKeyFor(seg);
+    if (pendingPrompt?.action === 'skip' && pendingPrompt.key !== key) removePrompt(false);
     const rule = CATEGORY_RULES[seg.category];
     if (!rule) { lastTime = t; return; }
-
-    // If the current segment is the suppressed one, do nothing (no prompts)
-    const key = segKeyFor(seg);
     if (suppressedSegmentKey === key) { lastTime = t; return; }
 
-    // Determine naturalPlay: small positive delta and not currently seeking and not known manualInSegment
     const delta = t - lastTime;
     const naturalPlay = delta > 0 && delta < 2 && !userSeeking && !manualInSegment;
     lastTime = t;
 
-    if (rule.mode === 'auto') {
-      if (naturalPlay) {
-        try {
-          videoEl.currentTime = Math.min(seg.end + 0.05, videoEl.duration || seg.end + 0.05);
-          showNotice(`${rule.label} 已跳过`, rule.color);
-        } catch (e) { LOG('auto skip failed', e); }
-      } else {
-        // user manually seeked into it -> do nothing (allow watching)
-      }
-    } else if (rule.mode === 'manual') {
-      // show prompt only on naturalPlay OR if user arrived exactly at seg.start (special case)
-      // But we must avoid prompting repeatedly: only show if not pendingPrompt and not suppressed
-      if (!pendingPrompt && naturalPlay) {
-        showManualPrompt(seg, rule);
-      }
-      // also: if user just seeked exactly to segment start (we detect in seeking handler and set manualInSegment accordingly),
-      // we want to show prompt when they re-enter segment HEAD (requirement #4). We'll handle that in seeking handler.
+    if (rule.mode === 'auto' && naturalPlay) {
+      performSkip(seg, rule);
+    } else if (rule.mode === 'manual' && naturalPlay && !pendingPrompt) {
+      showPrompt(seg, rule);
     }
   }
 
@@ -341,49 +358,46 @@
       const t = videoEl.currentTime;
       const seg = inSegmentAtTime(t);
       if (seg) {
-        // user manually entered the segment -> set manualInSegment true and do NOT show prompt instantly
+        // user manually entered the segment -> set manualInSegment true and DO NOT show prompt instantly
         manualInSegment = true;
-        // Do NOT set suppressedSegmentKey yet — we only suppress after user actively closes prompt.
         LOG('User seeking: manualInSegment set for segment', segKeyFor(seg));
       }
     } catch (e) { LOG('onSeeking error', e); }
   }
 
   function onSeeked() {
-    // If user seeked to just before the segment start (within small tolerance) -- treat as "re-enter at segment head"
     try {
       const t = videoEl.currentTime;
+      const ownSeek = ownSeekTime !== null && Math.abs(ownSeekTime - t) < 0.25;
+      ownSeekTime = null;
+      if (!ownSeek && pendingPrompt?.action === 'undo') removePrompt(false);
       const seg = inSegmentAtTime(t);
       if (seg) {
-        const tolerance = 0.35; // seconds tolerance for "segment head"
-        if (Math.abs(t - seg.start) < tolerance) {
-          // reset suppression for this segment so prompt will appear (requirement 4)
-          if (suppressedSegmentKey === segKeyFor(seg)) {
-            suppressedSegmentKey = null;
-            LOG('User jumped to segment head -> cleared suppression for', segKeyFor(seg));
-          }
-          // Show prompt since user explicitly jumped to segment head (but only if not already pending)
-          if (!pendingPrompt && CATEGORY_RULES[seg.category].mode === 'manual') {
-            // show prompt after a tiny delay so timeupdate doesn't race
-            setTimeout(()=>{ if (!pendingPrompt) showManualPrompt(seg, CATEGORY_RULES[seg.category]); }, 60);
-          }
-        } else {
-          // user seeked somewhere inside the segment - mark manualInSegment so we don't auto-skip
-          manualInSegment = true;
+        manualInSegment = true;
+        const rule = CATEGORY_RULES[seg.category];
+        // A manual return offers a skip button, but never skips automatically.
+        if (rule && rule.mode !== 'marker' && !ownSeek && !pendingPrompt) {
+          const seekingVideo = videoEl;
+          setTimeout(() => {
+            if (pendingPrompt || videoEl !== seekingVideo) return;
+            if (videoEl.currentTime >= seg.start && videoEl.currentTime < seg.end) {
+              showPrompt(seg, rule);
+            }
+          }, 60);
         }
       } else {
-        // not in segment
         manualInSegment = false;
       }
     } catch (e) { LOG('onSeeked error', e); }
-    // clear seeking flag after short delay
-    setTimeout(()=> { userSeeking = false; }, 700);
+    setTimeout(() => { userSeeking = false; }, 700);
   }
 
   function attachVideoHandlers(v) {
-    if (!v) return;
+    if (!v || videoEl === v) return;
     if (videoEl && videoEl !== v) {
       try {
+        removePrompt(false);
+        ownSeekTime = null;
         videoEl.removeEventListener('timeupdate', onTimeUpdate);
         videoEl.removeEventListener('seeking', onSeeking);
         videoEl.removeEventListener('seeked', onSeeked);
@@ -458,6 +472,8 @@
   async function initializeForBV() {
     const bv = getBV(); if (!bv) return;
     if (bv === currentBV) return;
+    removePrompt(false);
+    ownSeekTime = null;
     currentBV = bv;
     LOG('Initialize for', bv);
     // reset state
