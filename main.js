@@ -7,6 +7,8 @@
 // @author       NeoGe_and_GPT-5
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/*
+// @match        https://www.bilibili.com/list/*
+// @match        https://www.bilibili.com/medialist/play/*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL https://update.greasyfork.org/scripts/553623/BilibiliSponsorBlock-Tampermonkey.user.js
@@ -20,18 +22,19 @@
 
   // state
   let currentBV = null;
+  let segmentRequestId = 0;
   let segments = [];
   let videoEl = null;
   let progressEl = null;
   let markerLayer = null;
   let observer = null;
-  let pendingPrompt = null;    // { seg, rule, key, action, fromTime, video, deadline }
+  let pendingPrompt = null; // { seg, rule, key, action, fromTime, video, deadline }
   let promptTimer = null;
 
   // control flags
-  let manualInSegment = false; // user manually entered this ad segment
+  let manualInSegment = false;
   let userSeeking = false;
-  let suppressedSegmentKey = null; // the segment key for which prompts are suppressed while inside it
+  let suppressedSegmentKey = null;
   let lastTime = 0;
 
   // throttle
@@ -86,7 +89,6 @@
       const el = document.querySelector(s);
       if (el) return el;
     }
-    // fallback near controls
     const ctrl = document.querySelector('.bilibili-player-video-control-bottom') || document.querySelector('.bpx-player-container');
     if (ctrl) {
       const el = ctrl.querySelector('.bpx-player-progress-wrap, .bpx-player-progress, .bilibili-player-video-progress');
@@ -146,11 +148,9 @@
     }
   }
 
-  // ---------- prompt management ----------
-  // segKey string
+  // ---------- prompt and skip / undo management ----------
   function segKeyFor(seg){ return `${seg.start}-${seg.end}`; }
 
-  // ---------- skip / undo ----------
   const UNDO_SECONDS = 5;
   const RESKIP_SECONDS = 3;
   let ownSeekTime = null;
@@ -183,7 +183,6 @@
     if (prompt.action === 'undo') {
       const { seg, rule, fromTime } = prompt;
       removePrompt(false);
-      // Keep the original auto-skip suppressed after undoing it.
       suppressedSegmentKey = segKeyFor(seg);
       manualInSegment = true;
       const gap = Math.min(0.05, (seg.end - seg.start) / 4);
@@ -218,27 +217,15 @@
   function showPrompt(seg, rule, action = 'skip', seconds = 5, fromTime = null) {
     try {
       removePrompt(false);
-      // The old prompt may still be fading out; do not leave duplicate IDs.
       document.getElementById('bsb-prompt')?.remove();
 
       const div = document.createElement('div');
       div.id = 'bsb-prompt';
       div.style.cssText = `
-        position:fixed;
-        right:40px;
-        bottom:120px;
-        background:rgba(0,0,0,0.78);
-        color:#fff;
-        padding:10px 14px;
-        border-radius:10px;
-        font-size:14px;
-        z-index:2147483647;
-        display:flex;
-        align-items:center;
-        gap:8px;
-        pointer-events:auto;
-        user-select:none;
-        opacity:0;
+        position:fixed; right:40px; bottom:120px; background:rgba(0,0,0,0.78);
+        color:#fff; padding:10px 14px; border-radius:10px; font-size:14px;
+        z-index:2147483647; display:flex; align-items:center; gap:8px;
+        pointer-events:auto; user-select:none; opacity:0;
       `;
 
       const span = document.createElement('span');
@@ -290,9 +277,9 @@
       });
       const target = uiRoot();
       target.appendChild(el);
-      requestAnimationFrame(()=> el.style.opacity='1');
-      setTimeout(()=> el.style.opacity='0', 1600);
-      setTimeout(()=> el.remove(), 2000);
+      requestAnimationFrame(() => el.style.opacity='1');
+      setTimeout(() => el.style.opacity='0', 1600);
+      setTimeout(() => el.remove(), 2000);
     } catch (e) { LOG('showNotice error', e); }
   }
 
@@ -301,7 +288,7 @@
     window.addEventListener('keydown', (ev) => {
       try {
         const target = ev.target;
-        if (target?.isContentEditable || target?.closest?.('input,textarea,select,[contenteditable="true"]')) return;
+        if (target?.isContentEditable || target?.closest?.('input,textarea,select,[contenteditable=\"true\"]')) return;
         if (ev.key === 'Enter' && !ev.repeat && !ev.isComposing &&
             !ev.shiftKey && !ev.altKey && !ev.ctrlKey && !ev.metaKey) {
           if (pendingPrompt && runPromptAction()) {
@@ -318,12 +305,18 @@
   }
 
   // ---------- playback handlers ----------
+  function syncPlaybackContext() {
+    if (getBV() === currentBV) return true;
+    initializeForBV();
+    return false;
+  }
+
   function inSegmentAtTime(t) {
     return segments.find(s => t >= s.start && t < s.end);
   }
 
   function onTimeUpdate() {
-    if (!videoEl) return;
+    if (!videoEl || !syncPlaybackContext()) return;
     const t = videoEl.currentTime;
     const seg = inSegmentAtTime(t);
 
@@ -353,19 +346,18 @@
   }
 
   function onSeeking() {
+    if (!videoEl || !syncPlaybackContext()) return;
     userSeeking = true;
     try {
       const t = videoEl.currentTime;
       const seg = inSegmentAtTime(t);
-      if (seg) {
-        // user manually entered the segment -> set manualInSegment true and DO NOT show prompt instantly
-        manualInSegment = true;
-        LOG('User seeking: manualInSegment set for segment', segKeyFor(seg));
-      }
+      if (seg) manualInSegment = true;
     } catch (e) { LOG('onSeeking error', e); }
   }
 
   function onSeeked() {
+    if (!videoEl || !syncPlaybackContext()) return;
+    const requestId = segmentRequestId;
     try {
       const t = videoEl.currentTime;
       const ownSeek = ownSeekTime !== null && Math.abs(ownSeekTime - t) < 0.25;
@@ -375,21 +367,18 @@
       if (seg) {
         manualInSegment = true;
         const rule = CATEGORY_RULES[seg.category];
-        // A manual return offers a skip button, but never skips automatically.
         if (rule && rule.mode !== 'marker' && !ownSeek && !pendingPrompt) {
           const seekingVideo = videoEl;
           setTimeout(() => {
-            if (pendingPrompt || videoEl !== seekingVideo) return;
-            if (videoEl.currentTime >= seg.start && videoEl.currentTime < seg.end) {
-              showPrompt(seg, rule);
-            }
+            if (requestId !== segmentRequestId || pendingPrompt || videoEl !== seekingVideo) return;
+            if (videoEl.currentTime >= seg.start && videoEl.currentTime < seg.end) showPrompt(seg, rule);
           }, 60);
         }
       } else {
         manualInSegment = false;
       }
     } catch (e) { LOG('onSeeked error', e); }
-    setTimeout(() => { userSeeking = false; }, 700);
+    setTimeout(() => { if (requestId === segmentRequestId) userSeeking = false; }, 700);
   }
 
   function attachVideoHandlers(v) {
@@ -422,7 +411,7 @@
       if (observer) { observer.disconnect(); observer = null; }
       const target = findProgress();
       if (!target) return;
-      observer = new MutationObserver(()=> scheduleRenderThrottled());
+      observer = new MutationObserver(() => scheduleRenderThrottled());
       observer.observe(target, { childList: true, subtree: true });
       LOG('Progress observer attached.');
     } catch (e) { LOG('attachProgressObserver error', e); }
@@ -454,15 +443,13 @@
       if (!videoEl || !segments.length) return;
       const p = findProgress();
       if (!p) { delayedMarkerAttempts(3,800); return; }
-      if (!p.contains(markerLayer) || !markerLayer) {
+      if (!markerLayer || !p.contains(markerLayer)) {
         LOG('Marker layer missing -> reattach');
         ensureMarkerLayerAttached();
         scheduleRenderThrottled();
         delayedMarkerAttempts(3,700);
-      } else {
-        if (markerLayer && markerLayer.children.length === 0 && segments.length > 0) {
-          scheduleRenderThrottled();
-        }
+      } else if (markerLayer.children.length === 0 && segments.length > 0) {
+        scheduleRenderThrottled();
       }
       if (!observer) attachProgressObserver();
     } catch (e) { LOG('checkProgressAndMarkers error', e); }
@@ -470,22 +457,26 @@
 
   // init for BV
   async function initializeForBV() {
-    const bv = getBV(); if (!bv) return;
+    const bv = getBV();
     if (bv === currentBV) return;
+    const requestId = ++segmentRequestId;
     removePrompt(false);
     ownSeekTime = null;
     currentBV = bv;
     LOG('Initialize for', bv);
-    // reset state
+    segments = [];
+    if (markerLayer) markerLayer.innerHTML = '';
     suppressedSegmentKey = null;
     manualInSegment = false;
     userSeeking = false;
-    pendingPrompt && removePrompt(false);
+    lastTime = 0;
+    if (!bv) return;
 
-    segments = await fetchSegments(bv);
+    const fetchedSegments = await fetchSegments(bv);
+    if (requestId !== segmentRequestId || getBV() !== bv) return;
+    segments = fetchedSegments;
     LOG('Segments loaded', segments.length);
 
-    // attach video handlers if present
     const v = findVideo();
     if (v) attachVideoHandlers(v);
     scheduleRenderThrottled();
@@ -498,8 +489,8 @@
   setInterval(() => {
     if (location.href !== lastHref) {
       lastHref = location.href;
-      LOG('URL changed -> schedule init');
-      setTimeout(initializeForBV, 700);
+      LOG('URL changed -> init');
+      initializeForBV();
     }
     try { checkVideoChange(); checkProgressAndMarkers(); } catch (e) {}
   }, 800);
