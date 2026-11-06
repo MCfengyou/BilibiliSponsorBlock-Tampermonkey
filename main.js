@@ -2,13 +2,11 @@
 // @license MIT
 // @name         BilibiliSponsorBlock-Tampermonkey
 // @namespace    https://github.com/MCfengyou/BilibiliSponsorBlock-Tampermonkey
-// @version      1.2
+// @version      1.1
 // @description  使用 bsbsb.top API 跳过标注片段，并以绿色在进度条上标注广告时段
 // @author       NeoGe_and_GPT-5
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/bangumi/*
-// @match        https://www.bilibili.com/list/*
-// @match        https://www.bilibili.com/medialist/play/*
 // @grant        none
 // @run-at       document-idle
 // @downloadURL https://update.greasyfork.org/scripts/553623/BilibiliSponsorBlock-Tampermonkey.user.js
@@ -24,7 +22,6 @@
 
   // state
   let currentBV = null;
-  let segmentRequestId = 0;
   let segments = [];
   let videoEl = null;
   let progressEl = null;
@@ -53,7 +50,6 @@
   };
 
   // ---------- helpers ----------
-  // Playlist pages put the current BV in the bvid query parameter.
   function getBV(){ const m = location.href.match(/BV[0-9A-Za-z]+/); return m ? m[0] : null; }
 
   async function fetchSegments(bv) {
@@ -267,7 +263,6 @@
     window.addEventListener('keydown', (ev) => {
       try {
         if (!pendingPrompt) return;
-        if (!syncPlaybackContext()) return;
         if (ev.key === 'Enter') {
           // perform skip
           if (videoEl && pendingPrompt) {
@@ -286,18 +281,12 @@
   }
 
   // ---------- playback handlers ----------
-  function syncPlaybackContext() {
-    if (getBV() === currentBV) return true;
-    initializeForBV();
-    return false;
-  }
-
   function inSegmentAtTime(t) {
     return segments.find(s => t >= s.start && t < s.end);
   }
 
   function onTimeUpdate() {
-    if (!videoEl || !syncPlaybackContext()) return;
+    if (!videoEl) return;
     const t = videoEl.currentTime;
     const seg = inSegmentAtTime(t);
 
@@ -347,7 +336,6 @@
   }
 
   function onSeeking() {
-    if (!videoEl || !syncPlaybackContext()) return;
     userSeeking = true;
     try {
       const t = videoEl.currentTime;
@@ -362,8 +350,6 @@
   }
 
   function onSeeked() {
-    if (!videoEl || !syncPlaybackContext()) return;
-    const requestId = segmentRequestId;
     // If user seeked to just before the segment start (within small tolerance) -- treat as "re-enter at segment head"
     try {
       const t = videoEl.currentTime;
@@ -379,11 +365,7 @@
           // Show prompt since user explicitly jumped to segment head (but only if not already pending)
           if (!pendingPrompt && CATEGORY_RULES[seg.category].mode === 'manual') {
             // show prompt after a tiny delay so timeupdate doesn't race
-            setTimeout(()=> {
-              if (requestId === segmentRequestId && getBV() === currentBV && !pendingPrompt) {
-                showManualPrompt(seg, CATEGORY_RULES[seg.category]);
-              }
-            }, 60);
+            setTimeout(()=>{ if (!pendingPrompt) showManualPrompt(seg, CATEGORY_RULES[seg.category]); }, 60);
           }
         } else {
           // user seeked somewhere inside the segment - mark manualInSegment so we don't auto-skip
@@ -395,7 +377,7 @@
       }
     } catch (e) { LOG('onSeeked error', e); }
     // clear seeking flag after short delay
-    setTimeout(()=> { if (requestId === segmentRequestId) userSeeking = false; }, 700);
+    setTimeout(()=> { userSeeking = false; }, 700);
   }
 
   function attachVideoHandlers(v) {
@@ -474,25 +456,17 @@
 
   // init for BV
   async function initializeForBV() {
-    const bv = getBV();
+    const bv = getBV(); if (!bv) return;
     if (bv === currentBV) return;
-    const requestId = ++segmentRequestId;
     currentBV = bv;
     LOG('Initialize for', bv);
     // reset state
-    segments = [];
-    if (markerLayer) markerLayer.innerHTML = '';
     suppressedSegmentKey = null;
     manualInSegment = false;
     userSeeking = false;
-    lastTime = 0;
     pendingPrompt && removePrompt(false);
-    if (!bv) return;
 
-    const fetchedSegments = await fetchSegments(bv);
-    // A previous playlist entry may finish loading after the current one.
-    if (requestId !== segmentRequestId || getBV() !== bv) return;
-    segments = fetchedSegments;
+    segments = await fetchSegments(bv);
     LOG('Segments loaded', segments.length);
 
     // attach video handlers if present
@@ -508,8 +482,8 @@
   setInterval(() => {
     if (location.href !== lastHref) {
       lastHref = location.href;
-      LOG('URL changed -> init');
-      initializeForBV();
+      LOG('URL changed -> schedule init');
+      setTimeout(initializeForBV, 700);
     }
     try { checkVideoChange(); checkProgressAndMarkers(); } catch (e) {}
   }, 800);
